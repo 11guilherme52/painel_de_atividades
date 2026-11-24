@@ -1,0 +1,6 @@
+# banco local (seus dados ficam só na sua máquina)
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+.venv/
