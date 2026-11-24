@@ -111,6 +111,9 @@ aside{display:flex;flex-direction:column;gap:16px}
 .catrow .t{text-align:right;color:var(--muted);font-size:12px}
 textarea{width:100%;min-height:96px;resize:vertical;border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:8px 10px;font-size:14px}
 .hint{font-size:12px;color:var(--muted);margin:6px 0 0}
+.offline{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--warn);background:color-mix(in srgb,var(--warn) 10%,var(--surface));border-radius:var(--r);padding:12px 14px;margin-bottom:16px;font-size:14px}
+.offline > div{flex:1 1 260px;min-width:0}
+.offline .addr{font-size:12px;color:var(--muted);margin-top:4px;overflow-wrap:anywhere}
 .status{font-size:12px;color:var(--muted);margin-top:24px;text-align:center}
 .status.err{color:var(--danger)}
 @media (prefers-reduced-motion:no-preference){.wd .fill,.catrow .track i{transition:height .3s,width .3s}}
@@ -152,6 +155,11 @@ textarea{width:100%;min-height:96px;resize:vertical;border:1px solid var(--line)
         <div class="cats" id="cats" role="group" aria-label="Categoria"></div>
       </form>
 
+      <div id="offline" class="offline" role="alert" hidden>
+        <div><strong>Banco de dados desconectado.</strong> <span id="offline-msg"></span>
+          <div class="addr">Procurando em <span class="mono" id="offline-addr"></span> · tentando de novo a cada 5 segundos</div></div>
+        <button class="btn" type="button" id="retry">Tentar agora</button>
+      </div>
       <div id="carry" class="carry" hidden></div>
       <div id="lists"></div>
     </main>
@@ -204,48 +212,72 @@ function elapsed(it){return (it.sec||0)+(it.run?Math.max(0,(Date.now()-it.run)/1
 function fmt(sec){sec=Math.round(sec);const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60);if(h)return h+'h '+pad(m)+'min';return m+'min'}
 function fmtLive(sec){sec=Math.floor(sec);const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;return (h?h+':'+pad(m):m)+':'+pad(s)}
 
-/* ---------- persistence ---------- */
-const chain={},queued={};
+/* ---------- persistence: servidor local + SQLite ---------- */
+// Na página do GitHub Pages, fala com o servidor rodando no seu computador.
+// Servida pelo próprio servidor (localhost), usa o mesmo endereço.
+const qs=new URLSearchParams(location.search).get('servidor');
+if(qs){try{localStorage.setItem('meu-dia-servidor',qs)}catch(e){}}
+const LOCAL=['localhost','127.0.0.1'].includes(location.hostname);
+let API=LOCAL?'':(qs||(()=>{try{return localStorage.getItem('meu-dia-servidor')}catch(e){return null}})()||'http://localhost:8000');
+API=API.replace(/\/+$/,'');
+const chain={},queued={},dirty=new Set();
+let loaded=false,retryT=null;
+async function req(method,path,body){
+  let r;
+  try{r=await fetch(API+path,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined})}
+  catch(e){const err=new Error('offline');err.offline=true;throw err}
+  if(!r.ok){let msg='HTTP '+r.status;try{msg=(await r.json()).erro||msg}catch(e){}throw new Error(msg)}
+  return r.json();
+}
 function save(k){
-  if(!store||queued[k])return;
+  if(!store){dirty.add(k);return}
+  if(queued[k])return;
   queued[k]=true;
   chain[k]=(chain[k]||Promise.resolve()).then(async()=>{
     queued[k]=false;
     const d=state.days[k];
     if(!d||(!d.items.length&&!d.note))await store.remove(k);
-    else await store.save(k,{items:d.items,note:d.note||'',updated:Date.now()});
-    setStatus(store.label);
-  }).catch(e=>{queued[k]=false;setStatus(e&&e.code==='quota_exceeded'?'Espaço cheio: apague dias antigos para continuar salvando.':'Não foi possível salvar agora. Suas mudanças continuam na tela; tente de novo em instantes.',true)});
+    else await store.save(k,{items:d.items,note:d.note||''});
+    dirty.delete(k);
+    setStatus(store?store.label:'');
+  }).catch(e=>{
+    queued[k]=false;dirty.add(k);
+    if(e.offline)goOffline();
+    else setStatus('Não foi possível salvar: '+e.message,true);
+  });
 }
 function setStatus(t,err){const s=$('status');s.textContent=t;s.classList.toggle('err',!!err)}
-
-function useLocal(reason){
-  try{const raw=localStorage.getItem('meu-dia-v1');if(raw)state.days=JSON.parse(raw)||{}}catch(e){}
-  store={label:reason||'Salvo neste navegador.',
-    save:async()=>{try{localStorage.setItem('meu-dia-v1',JSON.stringify(state.days))}catch(e){}},
-    remove:async()=>{try{localStorage.setItem('meu-dia-v1',JSON.stringify(state.days))}catch(e){}}};
-  setStatus(store.label);render();
+function goOffline(){
+  store=null;
+  const b=$('offline');b.hidden=false;
+  $('offline-msg').textContent=loaded
+    ?'O servidor no seu computador parou de responder. Suas mudanças ficam guardadas aqui e são salvas assim que ele voltar.'
+    :'Não encontrei o servidor no seu computador. Abra o Meu Dia pelo atalho iniciar.bat ou rode python app.py na pasta do projeto.'+(LOCAL?'':' Se o navegador perguntar se este site pode acessar a rede local ou outros dispositivos, clique em Permitir.');
+  $('offline-addr').textContent=API||location.origin;
+  document.querySelectorAll('#addform input,#addform button').forEach(x=>x.disabled=!loaded);
+  setStatus('Sem conexão com o banco de dados.',true);
+  clearTimeout(retryT);retryT=setTimeout(connect,5000);
 }
-
-async function init(){
-  render();
+async function connect(){
+  clearTimeout(retryT);
   try{
-    const r=await fetch('/api/dias');
-    if(!r.ok)throw new Error(r.status);
-    const data=await r.json();
-    state.days=data.dias||{};
-  }catch(e){useLocal('Servidor local indisponível. Salvando só neste navegador.');return}
-  const req=async(method,k,body)=>{
-    const r=await fetch('/api/dias/'+k,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-  };
-  store={label:'Salvo no banco local (meu_dia.db).',
-    save:(k,b)=>req('PUT',k,b),remove:k=>req('DELETE',k)};
-  setStatus(store.label);render();
+    store={label:'Salvo no banco do seu computador (meu_dia.db).',
+      save:(k,b)=>req('PUT','/api/dias/'+k,b),remove:k=>req('DELETE','/api/dias/'+k)};
+    // envia primeiro o que mudou enquanto estava sem conexão
+    for(const k of [...dirty]){const d=state.days[k];
+      if(!d||(!d.items.length&&!d.note))await store.remove(k);else await store.save(k,{items:d.items,note:d.note||''});
+      dirty.delete(k)}
+    const data=await req('GET','/api/dias');
+    state.days=data.dias||{};loaded=true;
+    $('offline').hidden=true;
+    document.querySelectorAll('#addform input,#addform button').forEach(x=>x.disabled=false);
+    setStatus(store.label);render();
+  }catch(e){if(e.offline)goOffline();else{store=null;setStatus('Erro do servidor: '+e.message,true);retryT=setTimeout(connect,5000)}}
 }
+async function init(){render();await connect()}
 
 /* ---------- actions ---------- */
-function mutate(fn,k){k=k||state.date;fn(day(k));render();save(k)}
+function mutate(fn,k){if(!loaded){goOffline();return}k=k||state.date;fn(day(k));render();save(k)}
 function addItem(title,cat,at){
   title=title.trim();if(!title)return;
   mutate(d=>d.items.push({id:uid(),t:title,cat:cat,at:at||'',done:false,sec:0,run:null,created:Date.now()}));
@@ -424,11 +456,12 @@ function render(){
 
 /* ---------- events ---------- */
 $('addform').onsubmit=e=>{e.preventDefault();addItem($('newtitle').value,state.cat,$('newtime').value);$('newtitle').value='';$('newtime').value='';$('newtitle').focus()};
+$('retry').onclick=()=>connect();
 $('prev').onclick=()=>{state.date=addDays(state.date,-1);state.editing=null;render()};
 $('next').onclick=()=>{state.date=addDays(state.date,1);state.editing=null;render()};
 $('today').onclick=()=>{state.date=iso(new Date());render()};
 let noteT=null;
-$('note').oninput=()=>{const k=state.date;day(k).note=$('note').value;clearTimeout(noteT);noteT=setTimeout(()=>save(k),800)};
+$('note').oninput=()=>{if(!loaded)return;const k=state.date;day(k).note=$('note').value;clearTimeout(noteT);noteT=setTimeout(()=>save(k),800)};
 $('note').onblur=()=>{clearTimeout(noteT);save(state.date)};
 document.addEventListener('keydown',e=>{
   if(e.target.matches('input,textarea'))return;

@@ -1,7 +1,13 @@
 """Meu Dia — servidor local com banco SQLite.
 
+A interface pode ser aberta de dois jeitos, e os dois gravam no mesmo banco
+(meu_dia.db) aqui no seu computador:
+    - pelo GitHub Pages: https://11guilherme52.github.io/painel_de_atividades/
+    - direto pelo servidor: http://localhost:8000
+
 Uso:
-    python app.py              # abre em http://localhost:8000
+    python app.py                  # abre a página do GitHub Pages
+    python app.py --local          # abre http://localhost:8000
     python app.py --porta 9000
     python app.py --db outro.db
 
@@ -18,7 +24,10 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-STATIC = BASE / "static"
+STATIC = BASE / "docs"
+PAGES_URL = "https://11guilherme52.github.io/painel_de_atividades/"
+# Sites que podem ler e gravar no banco. O navegador bloqueia qualquer outro.
+ORIGENS = {"https://11guilherme52.github.io"}
 DATA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CATEGORIAS = {"trabalho", "pessoal", "saude", "estudo", "casa"}
 
@@ -125,9 +134,25 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*a, directory=str(STATIC), **kw)
 
     # --- utilidades ---
+    def _origem_ok(self):
+        """Sem cabeçalho Origin (curl, navegação direta) ou origem permitida."""
+        origem = self.headers.get("Origin")
+        if not origem:
+            return True
+        host, porta = self.server.server_address[:2]
+        locais = {f"http://localhost:{porta}", f"http://127.0.0.1:{porta}"}
+        return origem in ORIGENS or origem in locais
+
+    def _cors(self):
+        origem = self.headers.get("Origin")
+        if origem and origem in ORIGENS:
+            self.send_header("Access-Control-Allow-Origin", origem)
+            self.send_header("Vary", "Origin")
+
     def _json(self, status, obj):
         corpo = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self._cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(corpo)))
         self.send_header("Cache-Control", "no-store")
@@ -141,7 +166,30 @@ class Handler(SimpleHTTPRequestHandler):
         return m.group(1)
 
     # --- rotas ---
+    def do_OPTIONS(self):
+        # pré-verificação do navegador antes de PUT/DELETE vindos do GitHub Pages
+        if not self.path.startswith("/api/") or not self._origem_ok():
+            self.send_response(HTTPStatus.FORBIDDEN)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._cors()
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # Chrome pede isto quando um site público acessa o localhost
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
+    def _bloqueado(self):
+        if self.path.startswith("/api/") and not self._origem_ok():
+            self._json(HTTPStatus.FORBIDDEN, {"erro": "origem não permitida"})
+            return True
+        return False
+
     def do_GET(self):
+        if self._bloqueado():
+            return
         if self.path.split("?")[0] == "/api/dias":
             with conectar(self.db_path) as con:
                 return self._json(HTTPStatus.OK, {"dias": ler_dias(con)})
@@ -150,6 +198,8 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_PUT(self):
+        if self._bloqueado():
+            return
         dia = self._dia_da_rota()
         if not dia:
             return self._json(HTTPStatus.NOT_FOUND, {"erro": "use /api/dias/AAAA-MM-DD"})
@@ -165,6 +215,8 @@ class Handler(SimpleHTTPRequestHandler):
         return self._json(HTTPStatus.OK, {"ok": True})
 
     def do_DELETE(self):
+        if self._bloqueado():
+            return
         dia = self._dia_da_rota()
         if not dia:
             return self._json(HTTPStatus.NOT_FOUND, {"erro": "use /api/dias/AAAA-MM-DD"})
@@ -181,16 +233,24 @@ def main():
     p = argparse.ArgumentParser(description="Meu Dia — controle de atividades diárias")
     p.add_argument("--porta", type=int, default=8000)
     p.add_argument("--db", default=str(BASE / "meu_dia.db"), help="arquivo do banco SQLite")
+    p.add_argument("--local", action="store_true", help="abrir http://localhost em vez do GitHub Pages")
     p.add_argument("--sem-navegador", action="store_true", help="não abrir o navegador")
+    p.add_argument("--origem", action="append", default=[],
+                   help="outro site autorizado a usar o banco (ex.: https://usuario.github.io)")
     args = p.parse_args()
 
+    ORIGENS.update(o.rstrip("/") for o in args.origem)
     iniciar_banco(args.db)
     Handler.db_path = args.db
     srv = ThreadingHTTPServer(("127.0.0.1", args.porta), Handler)
-    url = f"http://localhost:{args.porta}"
-    print(f"Meu Dia rodando em {url}  (banco: {args.db})  — Ctrl+C para sair")
+    local = f"http://localhost:{args.porta}"
+    pages = PAGES_URL if args.porta == 8000 else f"{PAGES_URL}?servidor={local}"
+    print(f"Meu Dia: servidor ligado, gravando em {args.db}")
+    print(f"  GitHub Pages: {pages}")
+    print(f"  Local:        {local}")
+    print("Deixe esta janela aberta enquanto usa. Ctrl+C para desligar.")
     if not args.sem_navegador:
-        webbrowser.open(url)
+        webbrowser.open(local if args.local else pages)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
